@@ -245,17 +245,142 @@ with tab3:
         st.markdown("*LLM Chemistry context generates based on GC column names...*")
 
 # ==========================================
-# TAB 4 & 5: SIMULATION & OPTIMIZATION
+# TAB 4: SIMULATION (DIGITAL TWIN)
 # ==========================================
-# (These tabs remain exactly the same as the previous version, 
-# just ensure they use `st.session_state.filtered_data` instead of `stitched_data` for model training)
 with tab4:
-    if st.session_state.filtered_data is not None:
+    if st.session_state.stitched_data is not None:
         st.header("⚙️ Train Digital Twin & Simulate")
-        df_train = st.session_state.filtered_data
-        # ... [Rest of Tab 4 training logic using df_train] ...
-        st.info("Simulation engine ready. (Insert Tab 4 logic here from previous version)")
+        df = st.session_state.stitched_data
+        all_numeric = df.select_dtypes(include=[np.number]).columns.tolist()
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            target = st.selectbox("Select Target Variable (e.g., Top Quality, Steam Norm)", all_numeric)
+        with col2:
+            features = st.multiselect("Select Process Parameters (Features)", [c for c in all_numeric if c != target])
+            
+        if st.button("Train Digital Twin Model") and features:
+            X = df[features]
+            y = df[target]
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False) # Chronological split
+            
+            model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
+            model.fit(X_train, y_train)
+            
+            preds = model.predict(X_test)
+            r2 = r2_score(y_test, preds)
+            
+            st.session_state.ml_model = model
+            st.session_state.features = features
+            st.session_state.target = target
+            
+            st.success(f"Model Trained Successfully! R² Score on Test Data: {r2:.3f}")
+            
+        st.divider()
+        
+        if st.session_state.ml_model is not None:
+            st.subheader("🎛️ Process Simulator")
+            st.write("Adjust the process parameters below to simulate the impact on the target variable.")
+            
+            input_data = {}
+            sim_cols = st.columns(3)
+            # Create sliders for each feature based on historical min/max/mean
+            for i, feat in enumerate(st.session_state.features):
+                min_val = float(df[feat].min())
+                max_val = float(df[feat].max())
+                mean_val = float(df[feat].mean())
+                with sim_cols[i % 3]:
+                    input_data[feat] = st.slider(feat, min_value=min_val, max_value=max_val, value=mean_val)
+                    
+            if st.button("Run Simulation"):
+                input_df = pd.DataFrame([input_data])
+                prediction = st.session_state.ml_model.predict(input_df)[0]
+                
+                st.metric(label=f"Predicted {st.session_state.target}", value=f"{prediction:.4f}")
+                
+                # AI Validation
+                if api_key:
+                    with st.spinner("AI checking engineering constraints..."):
+                        sim_prompt = f"""
+                        Context: {st.session_state.chemistry_context}
+                        
+                        The operator simulated the following setpoints:
+                        {input_data}
+                        The ML model predicted a {st.session_state.target} of {prediction}.
+                        
+                        Based on chemical engineering principles, does this prediction seem thermodynamically sound? 
+                        Are there any risks of flooding, weeping, or off-spec material with these setpoints? Provide a 3-sentence technical advisory.
+                        """
+                        response = llm_model.generate_content(sim_prompt)
+                        st.info(f"**AI Process Engineer Advisory:**\n{response.text}")
+    else:
+        st.info("Please upload data in Tab 1.")
 
+# ==========================================
+# TAB 5: PROCESS OPTIMIZATION
+# ==========================================
 with tab5:
-    st.header("🚀 AI-Driven Process Optimization")
-    st.info("Optimization engine ready. (Insert Tab 5 logic here from previous version)")
+    if st.session_state.ml_model is not None:
+        st.header("🚀 AI-Driven Process Optimization")
+        st.write("Find the best operating regime to optimize your target variable.")
+        
+        opt_goal = st.radio("Optimization Goal", ["Maximize Target", "Minimize Target"])
+        
+        st.subheader("Set Constraint Bounds")
+        bounds = []
+        bound_inputs = {}
+        df = st.session_state.stitched_data
+        
+        # Let user define safe operating envelopes for the optimizer
+        for feat in st.session_state.features:
+            col1, col2 = st.columns(2)
+            min_hist = float(df[feat].min())
+            max_hist = float(df[feat].max())
+            with col1:
+                lower = st.number_input(f"{feat} Lower Bound", value=min_hist)
+            with col2:
+                upper = st.number_input(f"{feat} Upper Bound", value=max_hist)
+            bounds.append((lower, upper))
+            bound_inputs[feat] = (lower, upper)
+            
+        if st.button("Run Optimizer"):
+            with st.spinner("Finding optimal operating regime..."):
+                # Objective function for scipy
+                def objective(x):
+                    pred = st.session_state.ml_model.predict(pd.DataFrame([x], columns=st.session_state.features))[0]
+                    # Minimize returns the lowest value. If we want to maximize, we return negative prediction.
+                    return -pred if opt_goal == "Maximize Target" else pred
+                
+                # Initial guess (means of bounds)
+                x0 = [(b[0] + b[1]) / 2 for b in bounds]
+                
+                # Run L-BFGS-B optimization
+                res = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
+                
+                if res.success:
+                    st.success("Optimization Converged!")
+                    opt_pred = -res.fun if opt_goal == "Maximize Target" else res.fun
+                    
+                    st.metric(label=f"Optimized {st.session_state.target}", value=f"{opt_pred:.4f}")
+                    
+                    st.subheader("Recommended Setpoints")
+                    rec_data = {feat: val for feat, val in zip(st.session_state.features, res.x)}
+                    st.json(rec_data)
+                    
+                    # LLM Sanity Check of Optimized Results
+                    if api_key:
+                        opt_prompt = f"""
+                        Context: {st.session_state.chemistry_context}
+                        
+                        An algorithm optimized the distillation process to {opt_goal} {st.session_state.target}.
+                        Recommended setpoints are: {rec_data}
+                        Predicted outcome: {opt_pred}
+                        
+                        As a Senior Chemical Engineer, review these setpoints. Do they push the equipment too close to the edge of the operating envelope? Would you approve taking these setpoints to the actual plant DCS? Explain why or why not.
+                        """
+                        opt_response = llm_model.generate_content(opt_prompt)
+                        st.warning(f"**Safety & Engineering Review:**\n{opt_response.text}")
+                else:
+                    st.error("Optimization failed to converge. Try relaxing the bounds.")
+    else:
+        st.info("Please train the Digital Twin model in Tab 4 first.")
