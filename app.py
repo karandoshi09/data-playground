@@ -203,26 +203,37 @@ with tab4:
         col1, col2 = st.columns(2)
         with col1: target = st.selectbox("Select Target Variable for ML Model", all_numeric)
         with col2: features = st.multiselect("Select Process Parameters (Features)", [c for c in all_numeric if c != target])
-            
+
         if st.button("Train Digital Twin Model") and features:
             with st.spinner("Training XGBoost and calculating SHAP values..."):
-                X = df_train[features]
-                y = df_train[target]
-                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
                 
-                model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
-                model.fit(X_train, y_train)
+                # --- THE FIX: Drop rows where the Target variable is NaN ---
+                df_ml = df_train.dropna(subset=[target])
                 
-                preds = model.predict(X_test)
-                r2 = r2_score(y_test, preds)
-                
-                st.session_state.ml_model = model
-                st.session_state.features = features
-                st.session_state.target = target
-                st.session_state.X_train = X_train
-                st.session_state.X_test = X_test
-                
-                st.success(f"Model Trained! Test Data R² Score: {r2:.3f}")
+                # Safety check: ensure we still have enough data to train
+                if len(df_ml) < 20:
+                    st.error(f"Not enough valid data points ({len(df_ml)}) for target '{target}'. Your lab data might be too sparse. Try a different target or increase the interpolation limit in Tab 1.")
+                else:
+                    X = df_ml[features]
+                    y = df_ml[target]
+                    
+                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+                    
+                    # Initialize and train the model
+                    model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
+                    model.fit(X_train, y_train)
+                    
+                    preds = model.predict(X_test)
+                    r2 = r2_score(y_test, preds)
+                    
+                    # Save to session state
+                    st.session_state.ml_model = model
+                    st.session_state.features = features
+                    st.session_state.target = target
+                    st.session_state.X_train = X_train
+                    st.session_state.X_test = X_test
+                    
+                    st.success(f"Model Trained! Test Data R² Score: {r2:.3f}")
             
         if st.session_state.ml_model is not None:
             st.divider()
