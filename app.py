@@ -28,10 +28,21 @@ def process_quality_sheet(df, suffix):
     time_col = df.columns[cols.index('time')] if 'time' in cols else None
     
     if date_col and time_col:
+        # 1. Clean the string representations
         date_series = df[date_col].astype(str).str.replace('.', '/', regex=False)
         time_series = df[time_col].astype(str)
         
-        df['Timestamp'] = pd.to_datetime(date_series + ' ' + time_series, dayfirst=True, errors='coerce')
+        # 2. Force strict datetime parsing. We use dayfirst=True, but we also specify 
+        # format='%d/%m/%Y %H:%M:%S' as a fallback if dayfirst gets confused.
+        datetime_str = date_series + ' ' + time_series
+        
+        try:
+             # Try explicit format first if you know it's strictly DD/MM/YYYY
+             df['Timestamp'] = pd.to_datetime(datetime_str, format='%d/%m/%Y %H:%M:%S', errors='coerce')
+        except:
+             # Fallback to dayfirst if the time format is irregular (e.g., missing seconds)
+             df['Timestamp'] = pd.to_datetime(datetime_str, dayfirst=True, errors='coerce')
+             
         df = df.dropna(subset=['Timestamp']).drop(columns=[date_col, time_col])
         
         num_cols = df.columns.drop('Timestamp')
@@ -51,18 +62,21 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🚀 Optimization"
 ])
 
+
 # ==========================================
 # TAB 1: DATA UPLOAD & ENGINEERING
 # ==========================================
 with tab1:
     st.header("1. Upload Process & Quality Data")
     col1, col2 = st.columns(2)
+    
     with col1: process_file = st.file_uploader("Upload Process Data (CSV/XLSX)", type=['csv', 'xlsx', 'xls'])
     with col2: quality_file = st.file_uploader("Upload Quality Lab Data (Excel)", type=['xlsx', 'xls'])
 
     if process_file and quality_file:
         try:
             with st.spinner("Processing & Stitching Data..."):
+                # --- 1. Process Data Ingestion ---
                 if process_file.name.endswith('.csv'): df_process = pd.read_csv(process_file)
                 else: df_process = pd.read_excel(process_file)
                     
@@ -77,6 +91,7 @@ with tab1:
                 df_process[proc_num_cols] = df_process[proc_num_cols].apply(pd.to_numeric, errors='coerce')
                 df_process = df_process.set_index('Timestamp').resample('30min').mean(numeric_only=True).reset_index()
                 
+                # --- 2. Quality Data Ingestion ---
                 xls = pd.ExcelFile(quality_file)
                 sheet_names = [s.lower() for s in xls.sheet_names]
                 
@@ -84,17 +99,41 @@ with tab1:
                 top_df = process_quality_sheet(pd.read_excel(xls, xls.sheet_names[sheet_names.index('top')]) if 'top' in sheet_names else pd.DataFrame(), 'top')
                 bot_df = process_quality_sheet(pd.read_excel(xls, xls.sheet_names[sheet_names.index('bottom')]) if 'bottom' in sheet_names else pd.DataFrame(), 'bot')
                 
+                # --- 3. Merging ---
                 df_stitched = df_process.copy()
                 if not feed_df.empty: df_stitched = pd.merge(df_stitched, feed_df, on='Timestamp', how='left')
                 if not top_df.empty: df_stitched = pd.merge(df_stitched, top_df, on='Timestamp', how='left')
                 if not bot_df.empty: df_stitched = pd.merge(df_stitched, bot_df, on='Timestamp', how='left')
                 
+                # --- 4. Interpolation ---
                 qual_cols = [c for c in df_stitched.columns if c.endswith('_feed') or c.endswith('_top') or c.endswith('_bot')]
                 df_stitched[qual_cols] = df_stitched[qual_cols].interpolate(method='linear', limit=4, limit_direction='forward')
                 df_stitched = df_stitched.dropna(subset=qual_cols, how='all')
 
             st.success("✅ Data Cleaned, Stitched, and Interpolated Successfully!")
             st.divider()
+
+            # --- DISPLAY DATA TABLES AND STATS ---
+            st.subheader("Data Overview (Post-Stitching)")
+            
+            # Format timestamp for better Streamlit display
+            display_df = df_stitched.copy()
+            display_df['Timestamp'] = display_df['Timestamp'].dt.strftime('%Y-%m-%d %H:%M')
+            
+            c_top, c_bot = st.columns(2)
+            with c_top:
+                st.write("**Top 10 Rows:**")
+                st.dataframe(display_df.head(10))
+            with c_bot:
+                st.write("**Bottom 10 Rows:**")
+                st.dataframe(display_df.tail(10))
+                
+            st.write("**Summary Statistics:**")
+            st.dataframe(df_stitched.describe())
+            
+            st.divider()
+            
+            # --- Feature Engineering UI ---
             st.subheader("2. Engineer Physics Features")
             
             all_cols = ['None'] + list(df_stitched.columns)
@@ -121,6 +160,7 @@ with tab1:
                 st.session_state.stitched_data = df_stitched
                 st.session_state.filtered_data = df_stitched.copy()
                 st.success("Features Generated! Go to Tab 2.")
+                
         except Exception as e:
             st.error(f"Error processing files: {e}")
 
