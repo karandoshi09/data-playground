@@ -2,10 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
+from sklearn.inspection import PartialDependenceDisplay
 import xgboost as xgb
 from scipy.optimize import minimize
+import shap
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Distillation Digital Twin (PoC)", layout="wide", page_icon="🧪")
@@ -13,30 +16,29 @@ st.title("🧪 Distillation Column Digital Twin (PoC)")
 st.caption("Secure, offline Data Science and Simulation environment for Process Engineering.")
 
 # --- SESSION STATE INITIALIZATION ---
-for key in ['stitched_data', 'filtered_data', 'ml_model', 'features', 'target']:
+for key in ['stitched_data', 'filtered_data', 'ml_model', 'features', 'target', 'X_train', 'X_test']:
     if key not in st.session_state:
         st.session_state[key] = None if key != 'features' else []
 
 # --- HELPER FUNCTIONS ---
 @st.cache_data
 def process_quality_sheet(df, suffix):
-    """Combines Date and Time, applies dayfirst, adds suffixes, and rounds to 30min."""
     cols = [c.lower() for c in df.columns]
     date_col = df.columns[cols.index('date')] if 'date' in cols else None
     time_col = df.columns[cols.index('time')] if 'time' in cols else None
     
     if date_col and time_col:
-        # Create Timestamp with dayfirst=True
-        df['Timestamp'] = pd.to_datetime(df[date_col].astype(str) + ' ' + df[time_col].astype(str), dayfirst=True, errors='coerce')
+        date_series = df[date_col].astype(str).str.replace('.', '/', regex=False)
+        time_series = df[time_col].astype(str)
+        
+        df['Timestamp'] = pd.to_datetime(date_series + ' ' + time_series, dayfirst=True, errors='coerce')
         df = df.dropna(subset=['Timestamp']).drop(columns=[date_col, time_col])
         
-        # Round to nearest 30 mins to align with process data
+        num_cols = df.columns.drop('Timestamp')
+        df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
+        
         df['Timestamp'] = df['Timestamp'].dt.round('30min')
-        
-        # Group by timestamp in case of duplicates
         df = df.groupby('Timestamp').mean(numeric_only=True).reset_index()
-        
-        # Add suffixes to composition columns
         df = df.rename(columns={c: f"{c}_{suffix}" for c in df.columns if c != 'Timestamp'})
     return df
 
@@ -45,7 +47,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📂 Data Upload & Engineering", 
     "📊 EDA & Filtering", 
     "📈 Quartile Analysis", 
-    "⚙️ Simulation", 
+    "⚙️ Simulation & Interpretability", 
     "🚀 Optimization"
 ])
 
@@ -55,29 +57,26 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     st.header("1. Upload Process & Quality Data")
     col1, col2 = st.columns(2)
-    
-    with col1:
-        process_file = st.file_uploader("Upload Process Data (CSV/XLSX)", type=['csv', 'xlsx', 'xls'])
-    with col2:
-        quality_file = st.file_uploader("Upload Quality Lab Data (Excel)", type=['xlsx', 'xls'])
+    with col1: process_file = st.file_uploader("Upload Process Data (CSV/XLSX)", type=['csv', 'xlsx', 'xls'])
+    with col2: quality_file = st.file_uploader("Upload Quality Lab Data (Excel)", type=['xlsx', 'xls'])
 
     if process_file and quality_file:
         try:
             with st.spinner("Processing & Stitching Data..."):
-                # 1. Load & Resample Process Data
-                if process_file.name.endswith('.csv'):
-                    df_process = pd.read_csv(process_file)
-                else:
-                    df_process = pd.read_excel(process_file)
+                if process_file.name.endswith('.csv'): df_process = pd.read_csv(process_file)
+                else: df_process = pd.read_excel(process_file)
                     
                 ts_col = [c for c in df_process.columns if 'time' in c.lower() or 'date' in c.lower()][0]
-                df_process['Timestamp'] = pd.to_datetime(df_process[ts_col], dayfirst=True, errors='coerce')
+                ts_series = df_process[ts_col].astype(str).str.replace('.', '/', regex=False)
+                df_process['Timestamp'] = pd.to_datetime(ts_series, dayfirst=True, errors='coerce')
+                
+                if ts_col != 'Timestamp': df_process = df_process.drop(columns=[ts_col])
                 df_process = df_process.dropna(subset=['Timestamp'])
                 
-                # Resample Process Data to 30 Min Average
+                proc_num_cols = df_process.columns.drop('Timestamp')
+                df_process[proc_num_cols] = df_process[proc_num_cols].apply(pd.to_numeric, errors='coerce')
                 df_process = df_process.set_index('Timestamp').resample('30min').mean(numeric_only=True).reset_index()
                 
-                # 2. Load Quality Data
                 xls = pd.ExcelFile(quality_file)
                 sheet_names = [s.lower() for s in xls.sheet_names]
                 
@@ -85,20 +84,16 @@ with tab1:
                 top_df = process_quality_sheet(pd.read_excel(xls, xls.sheet_names[sheet_names.index('top')]) if 'top' in sheet_names else pd.DataFrame(), 'top')
                 bot_df = process_quality_sheet(pd.read_excel(xls, xls.sheet_names[sheet_names.index('bottom')]) if 'bottom' in sheet_names else pd.DataFrame(), 'bot')
                 
-                # 3. Stitch Data
                 df_stitched = df_process.copy()
                 if not feed_df.empty: df_stitched = pd.merge(df_stitched, feed_df, on='Timestamp', how='left')
                 if not top_df.empty: df_stitched = pd.merge(df_stitched, top_df, on='Timestamp', how='left')
                 if not bot_df.empty: df_stitched = pd.merge(df_stitched, bot_df, on='Timestamp', how='left')
                 
-                # 4. Interpolate Quality Data (Linear, forward limit = 4)
                 qual_cols = [c for c in df_stitched.columns if c.endswith('_feed') or c.endswith('_top') or c.endswith('_bot')]
                 df_stitched[qual_cols] = df_stitched[qual_cols].interpolate(method='linear', limit=4, limit_direction='forward')
                 df_stitched = df_stitched.dropna(subset=qual_cols, how='all')
 
-            st.success("✅ Data Stitched and Interpolated Successfully!")
-            
-            # --- Feature Engineering UI ---
+            st.success("✅ Data Cleaned, Stitched, and Interpolated Successfully!")
             st.divider()
             st.subheader("2. Engineer Physics Features")
             
@@ -126,9 +121,6 @@ with tab1:
                 st.session_state.stitched_data = df_stitched
                 st.session_state.filtered_data = df_stitched.copy()
                 st.success("Features Generated! Go to Tab 2.")
-                
-            st.dataframe(df_stitched.head())
-
         except Exception as e:
             st.error(f"Error processing files: {e}")
 
@@ -138,7 +130,6 @@ with tab1:
 with tab2:
     if st.session_state.stitched_data is not None:
         df = st.session_state.stitched_data
-        
         st.subheader("🧹 Outlier Filtering")
         filter_cols = st.multiselect("Select columns to filter:", df.columns.drop('Timestamp'))
         
@@ -147,8 +138,7 @@ with tab2:
             f_cols = st.columns(min(len(filter_cols), 3))
             for i, col in enumerate(filter_cols):
                 min_val, max_val = float(df[col].min()), float(df[col].max())
-                with f_cols[i % 3]:
-                    filters[col] = st.slider(f"Range for {col}", min_val, max_val, (min_val, max_val))
+                with f_cols[i % 3]: filters[col] = st.slider(f"Range for {col}", min_val, max_val, (min_val, max_val))
         
         df_filtered = df.copy()
         for col, (f_min, f_max) in filters.items():
@@ -156,19 +146,15 @@ with tab2:
         
         st.session_state.filtered_data = df_filtered
         st.write(f"Data points remaining: **{len(df_filtered)}** out of **{len(df)}**")
-        
         st.divider()
-        st.subheader("📈 Exploratory Data Analysis")
-        all_cols = df_filtered.columns.drop('Timestamp').tolist()
         
         c1, c2 = st.columns(2)
         with c1:
-            trend_cols = st.multiselect("Time Series Trends", all_cols, default=all_cols[:1])
-            if trend_cols:
-                st.plotly_chart(px.line(df_filtered, x='Timestamp', y=trend_cols), use_container_width=True)
+            trend_cols = st.multiselect("Time Series Trends", df_filtered.columns.drop('Timestamp').tolist(), default=df_filtered.columns.drop('Timestamp').tolist()[:1])
+            if trend_cols: st.plotly_chart(px.line(df_filtered, x='Timestamp', y=trend_cols), use_container_width=True)
         with c2:
-            scat_x = st.selectbox("Scatter X-axis", all_cols, index=0)
-            scat_y = st.selectbox("Scatter Y-axis", all_cols, index=1 if len(all_cols)>1 else 0)
+            scat_x = st.selectbox("Scatter X-axis", df_filtered.columns.drop('Timestamp').tolist(), index=0)
+            scat_y = st.selectbox("Scatter Y-axis", df_filtered.columns.drop('Timestamp').tolist(), index=1)
             st.plotly_chart(px.scatter(df_filtered, x=scat_x, y=scat_y, trendline="ols"), use_container_width=True)
     else:
         st.info("Upload and process data in Tab 1 first.")
@@ -178,64 +164,35 @@ with tab2:
 # ==========================================
 with tab3:
     if st.session_state.filtered_data is not None:
-        st.header("📈 Quartile Cut Charts")
-        st.write("Bin your target variable to see the distribution and directionality of process parameters across different performance regimes.")
-        
         df_q = st.session_state.filtered_data.copy()
         numeric_cols = df_q.select_dtypes(include=[np.number]).columns.tolist()
         
         col1, col2 = st.columns(2)
-        with col1:
-            q_target = st.selectbox("Select Target Variable to Bin", numeric_cols)
-        with col2:
-            n_bins = st.slider("Number of Bins (e.g., 4 for Quartiles)", min_value=2, max_value=10, value=4)
-            
+        with col1: q_target = st.selectbox("Select Target Variable to Bin", numeric_cols)
+        with col2: n_bins = st.slider("Number of Bins", min_value=2, max_value=10, value=4)
         q_features = st.multiselect("Select Parameters to Analyze", [c for c in numeric_cols if c != q_target])
         
         if q_target and q_features:
             try:
-                # Create bins using qcut (quantile-based discretization)
                 df_q['Target_Bins'] = pd.qcut(df_q[q_target], q=n_bins, duplicates='drop')
-                # Convert interval to string for Plotly
                 df_q['Bin_Label'] = df_q['Target_Bins'].astype(str)
-                # Sort the dataframe so bins appear in order on the X-axis
                 df_q = df_q.sort_values('Target_Bins')
                 
-                st.divider()
-                st.subheader(f"Parameter Distributions across '{q_target}' Bins")
-                
-                # Render a Boxplot for each selected feature
                 for feature in q_features:
-                    fig = px.box(
-                        df_q, 
-                        x='Bin_Label', 
-                        y=feature, 
-                        color='Bin_Label',
-                        title=f"Directionality of {feature} relative to {q_target}",
-                        labels={'Bin_Label': f'{q_target} Bins'}
-                    )
+                    fig = px.box(df_q, x='Bin_Label', y=feature, color='Bin_Label', title=f"Directionality of {feature} relative to {q_target}")
                     fig.update_layout(showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
                 
-                st.divider()
-                st.subheader("Summary Statistics per Bin")
-                # Group by the bins to show the median/mean of the features
                 summary_stat = st.radio("Select Statistic to Display", ["Median", "Mean"])
-                
-                if summary_stat == "Median":
-                    summary_df = df_q.groupby('Bin_Label')[q_features].median().reset_index()
-                else:
-                    summary_df = df_q.groupby('Bin_Label')[q_features].mean().reset_index()
-                    
+                summary_df = df_q.groupby('Bin_Label')[q_features].median().reset_index() if summary_stat == "Median" else df_q.groupby('Bin_Label')[q_features].mean().reset_index()
                 st.dataframe(summary_df.style.background_gradient(cmap='Blues', axis=0))
-                
             except ValueError as e:
-                st.warning(f"Could not create bins for {q_target}. The data might lack enough variance. Error: {e}")
+                st.warning(f"Could not create bins for {q_target}. Error: {e}")
     else:
         st.info("Upload and filter data first.")
 
 # ==========================================
-# TAB 4: SIMULATION
+# TAB 4: SIMULATION & INTERPRETABILITY
 # ==========================================
 with tab4:
     if st.session_state.filtered_data is not None:
@@ -244,40 +201,86 @@ with tab4:
         all_numeric = df_train.select_dtypes(include=[np.number]).columns.tolist()
         
         col1, col2 = st.columns(2)
-        with col1:
-            target = st.selectbox("Select Target Variable for ML Model", all_numeric)
-        with col2:
-            features = st.multiselect("Select Process Parameters (Features)", [c for c in all_numeric if c != target])
+        with col1: target = st.selectbox("Select Target Variable for ML Model", all_numeric)
+        with col2: features = st.multiselect("Select Process Parameters (Features)", [c for c in all_numeric if c != target])
             
         if st.button("Train Digital Twin Model") and features:
-            X = df_train[features]
-            y = df_train[target]
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+            with st.spinner("Training XGBoost and calculating SHAP values..."):
+                X = df_train[features]
+                y = df_train[target]
+                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+                
+                model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
+                model.fit(X_train, y_train)
+                
+                preds = model.predict(X_test)
+                r2 = r2_score(y_test, preds)
+                
+                st.session_state.ml_model = model
+                st.session_state.features = features
+                st.session_state.target = target
+                st.session_state.X_train = X_train
+                st.session_state.X_test = X_test
+                
+                st.success(f"Model Trained! Test Data R² Score: {r2:.3f}")
             
-            model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
-            model.fit(X_train, y_train)
-            
-            preds = model.predict(X_test)
-            r2 = r2_score(y_test, preds)
-            
-            st.session_state.ml_model = model
-            st.session_state.features = features
-            st.session_state.target = target
-            
-            st.success(f"Model Trained! Test Data R² Score: {r2:.3f}")
-            
-        st.divider()
-        
         if st.session_state.ml_model is not None:
+            st.divider()
+            
+            # --- SHAP & PDP SECTION ---
+            st.subheader("📊 Model Interpretability")
+            
+            # 1. Calculate SHAP
+            explainer = shap.TreeExplainer(st.session_state.ml_model)
+            shap_values = explainer.shap_values(st.session_state.X_test)
+            
+            col_shap, col_pdp = st.columns(2)
+            
+            with col_shap:
+                st.markdown("**Feature Importance (SHAP Summary)**")
+                st.caption("Shows which parameters drive the target and in which direction.")
+                fig_shap, ax_shap = plt.subplots(figsize=(6, 4))
+                shap.summary_plot(shap_values, st.session_state.X_test, show=False, plot_size=(6,4))
+                st.pyplot(fig_shap)
+                plt.clf()
+            
+            with col_pdp:
+                st.markdown("**Partial Dependence Plots (Top 3 Parameters)**")
+                st.caption("Shows the isolated marginal effect of the top parameters on the target.")
+                
+                # Extract Top 3 Features based on mean absolute SHAP value
+                mean_shap_vals = np.abs(shap_values).mean(axis=0)
+                shap_importance = pd.DataFrame(list(zip(st.session_state.features, mean_shap_vals)), columns=['feature', 'importance'])
+                shap_importance = shap_importance.sort_values(by='importance', ascending=False)
+                top_3_features = shap_importance['feature'].head(3).tolist()
+                
+                if top_3_features:
+                    fig_pdp, ax_pdp = plt.subplots(figsize=(6, 4))
+                    # Adjust layout based on number of features (up to 3)
+                    n_cols = min(len(top_3_features), 3)
+                    PartialDependenceDisplay.from_estimator(
+                        st.session_state.ml_model, 
+                        st.session_state.X_train, 
+                        top_3_features, 
+                        ax=ax_pdp, 
+                        n_cols=n_cols,
+                        grid_resolution=20
+                    )
+                    fig_pdp.tight_layout()
+                    st.pyplot(fig_pdp)
+                    plt.clf()
+            
+            st.divider()
+            
+            # --- SIMULATOR SECTION ---
             st.subheader("🎛️ Process Simulator")
             input_data = {}
             sim_cols = st.columns(3)
             for i, feat in enumerate(st.session_state.features):
-                min_val = float(df_train[feat].min())
-                max_val = float(df_train[feat].max())
-                mean_val = float(df_train[feat].mean())
-                with sim_cols[i % 3]:
-                    input_data[feat] = st.slider(feat, min_val, max_val, mean_val)
+                min_val = float(st.session_state.X_train[feat].min())
+                max_val = float(st.session_state.X_train[feat].max())
+                mean_val = float(st.session_state.X_train[feat].mean())
+                with sim_cols[i % 3]: input_data[feat] = st.slider(feat, min_val, max_val, mean_val)
                     
             if st.button("Run Simulation"):
                 input_df = pd.DataFrame([input_data])
@@ -319,7 +322,6 @@ with tab5:
                     st.success("Optimization Converged!")
                     opt_pred = -res.fun if opt_goal == "Maximize Target" else res.fun
                     st.metric(label=f"Optimized {st.session_state.target}", value=f"{opt_pred:.4f}")
-                    
                     st.subheader("Recommended Setpoints")
                     st.json({feat: round(val, 2) for feat, val in zip(st.session_state.features, res.x)})
                 else:
