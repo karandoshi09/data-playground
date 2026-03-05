@@ -26,34 +26,32 @@ def process_quality_sheet(df, suffix):
     cols = [c.lower() for c in df.columns]
     date_col = df.columns[cols.index('date')] if 'date' in cols else None
     time_col = df.columns[cols.index('time')] if 'time' in cols else None
-
+    
     if date_col and time_col:
-        # 1. Safely extract Date
-        if pd.api.types.is_datetime64_any_dtype(df[date_col]):
-            date_series = df[date_col].dt.strftime('%d/%m/%Y')
-        else:
-            date_series = df[date_col].astype(str).str.replace('.', '/', regex=False)
-            
-        # 2. Safely extract Time
-        if pd.api.types.is_datetime64_any_dtype(df[time_col]):
-            time_series = df[time_col].dt.strftime('%H:%M:%S')
-        else:
-            time_series = df[time_col].astype(str)
-            
-        # 3. Combine and Parse
+        # Clean and extract just the date/time portions safely
+        date_series = df[date_col].astype(str).str.replace('.', '/', regex=False).str.split(' ').str[0]
+        time_series = df[time_col].astype(str).str.split(' ').str[-1]
+        
         datetime_str = date_series + ' ' + time_series
         
-        try:
-            df['Timestamp'] = pd.to_datetime(datetime_str, dayfirst=True, format='mixed', errors='coerce')
-        except ValueError:
-            df['Timestamp'] = pd.to_datetime(datetime_str, dayfirst=True, errors='coerce')
+        # 1. Try parsing with dayfirst=True
+        df['Timestamp'] = pd.to_datetime(datetime_str, dayfirst=True, errors='coerce')
         
-        df = df.dropna(subset=['Timestamp']).drop(columns=[date_col, time_col])
+        # 2. Fallback: If everything failed (all NaT), try standard parsing
+        if df['Timestamp'].isna().all():
+            df['Timestamp'] = pd.to_datetime(datetime_str, errors='coerce')
         
-        num_cols = df.columns.drop('Timestamp')
-        df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
+        cols_to_drop = [c for c in [date_col, time_col] if c != 'Timestamp']
+        df = df.dropna(subset=['Timestamp']).drop(columns=cols_to_drop)
         
+        num_cols = [c for c in df.columns if c != 'Timestamp']
+        for c in num_cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        
+        # Force datetime type to absolutely guarantee the .dt accessor works
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
         df['Timestamp'] = df['Timestamp'].dt.round('30min')
+        
         df = df.groupby('Timestamp').mean(numeric_only=True).reset_index()
         df = df.rename(columns={c: f"{c}_{suffix}" for c in df.columns if c != 'Timestamp'})
     return df
@@ -66,7 +64,6 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "⚙️ Simulation & Interpretability", 
     "🚀 Optimization"
 ])
-
 
 # ==========================================
 # TAB 1: DATA UPLOAD & ENGINEERING
@@ -81,46 +78,32 @@ with tab1:
     if process_file and quality_file:
         try:
             with st.spinner("Processing & Stitching Data..."):
-
-
                 # --- 1. Process Data Ingestion ---
-                if process_file.name.endswith('.csv'): 
-                    df_process = pd.read_csv(process_file)
-                else: 
-                    df_process = pd.read_excel(process_file)
+                if process_file.name.endswith('.csv'): df_process = pd.read_csv(process_file)
+                else: df_process = pd.read_excel(process_file)
                     
-                # Find the timestamp column safely
-                ts_col = [c for c in df_process.columns if 'timestamp' in c.lower() or 'time' in c.lower() or 'date' in c.lower()][0]
-
-                # --- THE BULLETPROOF DATETIME PARSING ---
-                if pd.api.types.is_datetime64_any_dtype(df_process[ts_col]):
-                    # If Excel already parsed it, DO NOT convert to string. Just copy it.
-                    df_process['Timestamp'] = df_process[ts_col]
-                else:
-                    # It is a string. Clean dots to slashes.
-                    ts_series = df_process[ts_col].astype(str).str.replace('.', '/', regex=False)
-                    
-                    # Use format='mixed' to handle rows with/without seconds, while enforcing DD/MM/YYYY
-                    try:
-                        df_process['Timestamp'] = pd.to_datetime(ts_series, dayfirst=True, format='mixed', errors='coerce')
-                    except ValueError:
-                        # Fallback for older pandas versions
-                        df_process['Timestamp'] = pd.to_datetime(ts_series, dayfirst=True, errors='coerce')
+                ts_col = [c for c in df_process.columns if 'time' in c.lower() or 'date' in c.lower()][0]
                 
-                # Drop original column if it was named something else
-                if ts_col != 'Timestamp': 
-                    df_process = df_process.drop(columns=[ts_col])
+                # Clean strings
+                ts_series = df_process[ts_col].astype(str).str.replace('.', '/', regex=False)
                 
-                # Drop rows where parsing failed
+                # Try dayfirst parse
+                df_process['Timestamp'] = pd.to_datetime(ts_series, dayfirst=True, errors='coerce')
+                
+                # Fallback if dayfirst completely failed (e.g. strict YYYY/MM/DD formats)
+                if df_process['Timestamp'].isna().all():
+                    df_process['Timestamp'] = pd.to_datetime(ts_series, errors='coerce')
+                
+                if ts_col != 'Timestamp': df_process = df_process.drop(columns=[ts_col])
                 df_process = df_process.dropna(subset=['Timestamp'])
                 
-                # Convert the rest of the columns to numeric
-                proc_num_cols = df_process.columns.drop('Timestamp')
-                df_process[proc_num_cols] = df_process[proc_num_cols].apply(pd.to_numeric, errors='coerce')
+                proc_num_cols = [c for c in df_process.columns if c != 'Timestamp']
+                for c in proc_num_cols:
+                    df_process[c] = pd.to_numeric(df_process[c], errors='coerce')
                 
-                # Resample to 30 mins
+                # Guarantee datetime type before index setting
+                df_process['Timestamp'] = pd.to_datetime(df_process['Timestamp'], errors='coerce')
                 df_process = df_process.set_index('Timestamp').resample('30min').mean(numeric_only=True).reset_index()
-
                 
                 # --- 2. Quality Data Ingestion ---
                 xls = pd.ExcelFile(quality_file)
@@ -147,20 +130,23 @@ with tab1:
             # --- DISPLAY DATA TABLES AND STATS ---
             st.subheader("Data Overview (Post-Stitching)")
             
-            # Format timestamp for better Streamlit display
             display_df = df_stitched.copy()
-            display_df['Timestamp'] = display_df['Timestamp'].dt.strftime('%Y-%m-%d %H:%M')
+            
+            # THE FIX: Safety check to prevent .dt error if dataframe is empty
+            if not display_df.empty:
+                display_df['Timestamp'] = pd.to_datetime(display_df['Timestamp'], errors='coerce')
+                display_df['Timestamp'] = display_df['Timestamp'].dt.strftime('%Y-%m-%d %H:%M')
             
             c_top, c_bot = st.columns(2)
             with c_top:
                 st.write("**Top 10 Rows:**")
-                st.dataframe(display_df.head(10))
+                st.dataframe(display_df.head(10) if not display_df.empty else display_df)
             with c_bot:
                 st.write("**Bottom 10 Rows:**")
-                st.dataframe(display_df.tail(10))
+                st.dataframe(display_df.tail(10) if not display_df.empty else display_df)
                 
             st.write("**Summary Statistics:**")
-            st.dataframe(df_stitched.describe())
+            st.dataframe(df_stitched.describe() if not df_stitched.empty else pd.DataFrame())
             
             st.divider()
             
