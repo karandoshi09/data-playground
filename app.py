@@ -7,13 +7,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 from sklearn.inspection import PartialDependenceDisplay
 import xgboost as xgb
-from scipy.optimize import minimize
+from scipy.optimize import differential_evolution  # Changed for XGBoost compatibility
 import shap
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Distillation Digital Twin (PoC)", layout="wide", page_icon="🧪")
 st.title("🧪 Distillation Column Digital Twin (PoC)")
-st.caption("Secure, offline Data Science and Simulation environment for Process Engineering.")
+# Caption removed as requested
 
 # --- SESSION STATE INITIALIZATION ---
 for key in ['stitched_data', 'filtered_data', 'ml_model', 'features', 'target', 'X_train', 'X_test']:
@@ -28,16 +28,12 @@ def process_quality_sheet(df, suffix):
     time_col = df.columns[cols.index('time')] if 'time' in cols else None
     
     if date_col and time_col:
-        # Clean and extract just the date/time portions safely
         date_series = df[date_col].astype(str).str.replace('.', '/', regex=False).str.split(' ').str[0]
         time_series = df[time_col].astype(str).str.split(' ').str[-1]
         
         datetime_str = date_series + ' ' + time_series
         
-        # 1. Try parsing with dayfirst=True
         df['Timestamp'] = pd.to_datetime(datetime_str, dayfirst=True, errors='coerce')
-        
-        # 2. Fallback: If everything failed (all NaT), try standard parsing
         if df['Timestamp'].isna().all():
             df['Timestamp'] = pd.to_datetime(datetime_str, errors='coerce')
         
@@ -48,7 +44,6 @@ def process_quality_sheet(df, suffix):
         for c in num_cols:
             df[c] = pd.to_numeric(df[c], errors='coerce')
         
-        # Force datetime type to absolutely guarantee the .dt accessor works
         df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
         df['Timestamp'] = df['Timestamp'].dt.round('30min')
         
@@ -78,19 +73,13 @@ with tab1:
     if process_file and quality_file:
         try:
             with st.spinner("Processing & Stitching Data..."):
-                # --- 1. Process Data Ingestion ---
                 if process_file.name.endswith('.csv'): df_process = pd.read_csv(process_file)
                 else: df_process = pd.read_excel(process_file)
                     
                 ts_col = [c for c in df_process.columns if 'time' in c.lower() or 'date' in c.lower()][0]
-                
-                # Clean strings
                 ts_series = df_process[ts_col].astype(str).str.replace('.', '/', regex=False)
                 
-                # Try dayfirst parse
                 df_process['Timestamp'] = pd.to_datetime(ts_series, dayfirst=True, errors='coerce')
-                
-                # Fallback if dayfirst completely failed (e.g. strict YYYY/MM/DD formats)
                 if df_process['Timestamp'].isna().all():
                     df_process['Timestamp'] = pd.to_datetime(ts_series, errors='coerce')
                 
@@ -101,11 +90,9 @@ with tab1:
                 for c in proc_num_cols:
                     df_process[c] = pd.to_numeric(df_process[c], errors='coerce')
                 
-                # Guarantee datetime type before index setting
                 df_process['Timestamp'] = pd.to_datetime(df_process['Timestamp'], errors='coerce')
                 df_process = df_process.set_index('Timestamp').resample('30min').mean(numeric_only=True).reset_index()
                 
-                # --- 2. Quality Data Ingestion ---
                 xls = pd.ExcelFile(quality_file)
                 sheet_names = [s.lower() for s in xls.sheet_names]
                 
@@ -113,13 +100,11 @@ with tab1:
                 top_df = process_quality_sheet(pd.read_excel(xls, xls.sheet_names[sheet_names.index('top')]) if 'top' in sheet_names else pd.DataFrame(), 'top')
                 bot_df = process_quality_sheet(pd.read_excel(xls, xls.sheet_names[sheet_names.index('bottom')]) if 'bottom' in sheet_names else pd.DataFrame(), 'bot')
                 
-                # --- 3. Merging ---
                 df_stitched = df_process.copy()
                 if not feed_df.empty: df_stitched = pd.merge(df_stitched, feed_df, on='Timestamp', how='left')
                 if not top_df.empty: df_stitched = pd.merge(df_stitched, top_df, on='Timestamp', how='left')
                 if not bot_df.empty: df_stitched = pd.merge(df_stitched, bot_df, on='Timestamp', how='left')
                 
-                # --- 4. Interpolation ---
                 qual_cols = [c for c in df_stitched.columns if c.endswith('_feed') or c.endswith('_top') or c.endswith('_bot')]
                 df_stitched[qual_cols] = df_stitched[qual_cols].interpolate(method='linear', limit=4, limit_direction='forward')
                 df_stitched = df_stitched.dropna(subset=qual_cols, how='all')
@@ -127,12 +112,13 @@ with tab1:
             st.success("✅ Data Cleaned, Stitched, and Interpolated Successfully!")
             st.divider()
 
-            # --- DISPLAY DATA TABLES AND STATS ---
+            # --- POPULATE SESSION STATE IMMEDIATELY SO USER CAN SKIP GENERATING FEATURES ---
+            st.session_state.stitched_data = df_stitched.copy()
+            st.session_state.filtered_data = df_stitched.copy()
+
             st.subheader("Data Overview (Post-Stitching)")
-            
             display_df = df_stitched.copy()
             
-            # THE FIX: Safety check to prevent .dt error if dataframe is empty
             if not display_df.empty:
                 display_df['Timestamp'] = pd.to_datetime(display_df['Timestamp'], errors='coerce')
                 display_df['Timestamp'] = display_df['Timestamp'].dt.strftime('%Y-%m-%d %H:%M')
@@ -150,9 +136,7 @@ with tab1:
             
             st.divider()
             
-            # --- Feature Engineering UI ---
-            st.subheader("2. Engineer Physics Features")
-            
+            st.subheader("2. Engineer Physics Features (Optional)")
             all_cols = ['None'] + list(df_stitched.columns)
             c1, c2, c3, c4 = st.columns(4)
             feed_c = c1.selectbox("Feed Flow", all_cols)
@@ -174,6 +158,7 @@ with tab1:
                 if t1_c != 'None' and t2_c != 'None': df_stitched['Delta_T'] = df_stitched[t1_c] - df_stitched[t2_c]
                 if p1_c != 'None' and p2_c != 'None': df_stitched['Delta_P'] = df_stitched[p1_c] - df_stitched[p2_c]
                 
+                # Re-update session state
                 st.session_state.stitched_data = df_stitched
                 st.session_state.filtered_data = df_stitched.copy()
                 st.success("Features Generated! Go to Tab 2.")
@@ -205,14 +190,33 @@ with tab2:
         st.write(f"Data points remaining: **{len(df_filtered)}** out of **{len(df)}**")
         st.divider()
         
-        c1, c2 = st.columns(2)
-        with c1:
-            trend_cols = st.multiselect("Time Series Trends", df_filtered.columns.drop('Timestamp').tolist(), default=df_filtered.columns.drop('Timestamp').tolist()[:1])
-            if trend_cols: st.plotly_chart(px.line(df_filtered, x='Timestamp', y=trend_cols), use_container_width=True)
-        with c2:
-            scat_x = st.selectbox("Scatter X-axis", df_filtered.columns.drop('Timestamp').tolist(), index=0)
-            scat_y = st.selectbox("Scatter Y-axis", df_filtered.columns.drop('Timestamp').tolist(), index=1)
-            st.plotly_chart(px.scatter(df_filtered, x=scat_x, y=scat_y, trendline="ols"), use_container_width=True)
+        st.subheader("📈 Exploratory Data Analysis")
+        all_cols = df_filtered.columns.drop('Timestamp').tolist()
+        
+        # FULL WIDTH TIME SERIES
+        trend_cols = st.multiselect("Time Series Trends", all_cols, default=all_cols[:1])
+        if trend_cols: 
+            st.plotly_chart(px.line(df_filtered, x='Timestamp', y=trend_cols), use_container_width=True)
+        
+        st.divider()
+        
+        # FULL WIDTH SCATTER
+        col_s1, col_s2 = st.columns(2)
+        with col_s1: scat_x = st.selectbox("Scatter X-axis", all_cols, index=0)
+        with col_s2: scat_y = st.selectbox("Scatter Y-axis", all_cols, index=1 if len(all_cols)>1 else 0)
+        st.plotly_chart(px.scatter(df_filtered, x=scat_x, y=scat_y, trendline="ols"), use_container_width=True)
+
+        st.divider()
+        
+        # FULL WIDTH HEATMAP
+        
+        st.subheader("🔥 Correlation Heatmap")
+        corr_cols = st.multiselect("Select parameters for Correlation Heatmap", all_cols, default=all_cols[:6] if len(all_cols)>6 else all_cols)
+        if len(corr_cols) > 1:
+            corr_matrix = df_filtered[corr_cols].corr()
+            fig_corr = px.imshow(corr_matrix, text_auto=".2f", aspect="auto", color_continuous_scale='RdBu_r', origin='lower')
+            st.plotly_chart(fig_corr, use_container_width=True)
+
     else:
         st.info("Upload and process data in Tab 1 first.")
 
@@ -240,9 +244,7 @@ with tab3:
                     fig.update_layout(showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
                 
-                summary_stat = st.radio("Select Statistic to Display", ["Median", "Mean"])
-                summary_df = df_q.groupby('Bin_Label')[q_features].median().reset_index() if summary_stat == "Median" else df_q.groupby('Bin_Label')[q_features].mean().reset_index()
-                st.dataframe(summary_df.style.background_gradient(cmap='Blues', axis=0))
+                # Removed the bottom summary statistics table as requested.
             except ValueError as e:
                 st.warning(f"Could not create bins for {q_target}. Error: {e}")
     else:
@@ -254,36 +256,31 @@ with tab3:
 with tab4:
     if st.session_state.filtered_data is not None:
         st.header("⚙️ Train Digital Twin & Simulate")
-        df_train = st.session_state.filtered_data
+        df_train = st.session_state.filtered_data.copy()
         all_numeric = df_train.select_dtypes(include=[np.number]).columns.tolist()
         
         col1, col2 = st.columns(2)
         with col1: target = st.selectbox("Select Target Variable for ML Model", all_numeric)
         with col2: features = st.multiselect("Select Process Parameters (Features)", [c for c in all_numeric if c != target])
-
+            
         if st.button("Train Digital Twin Model") and features:
             with st.spinner("Training XGBoost and calculating SHAP values..."):
-                
-                # --- THE FIX: Drop rows where the Target variable is NaN ---
                 df_ml = df_train.dropna(subset=[target])
                 
-                # Safety check: ensure we still have enough data to train
-                if len(df_ml) < 20:
-                    st.error(f"Not enough valid data points ({len(df_ml)}) for target '{target}'. Your lab data might be too sparse. Try a different target or increase the interpolation limit in Tab 1.")
+                if len(df_ml) < 10:
+                     st.error(f"Insufficient data to train. After dropping missing values for '{target}', only {len(df_ml)} rows remain.")
                 else:
                     X = df_ml[features]
                     y = df_ml[target]
                     
                     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
                     
-                    # Initialize and train the model
                     model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, max_depth=5)
                     model.fit(X_train, y_train)
                     
                     preds = model.predict(X_test)
                     r2 = r2_score(y_test, preds)
                     
-                    # Save to session state
                     st.session_state.ml_model = model
                     st.session_state.features = features
                     st.session_state.target = target
@@ -297,46 +294,41 @@ with tab4:
             
             # --- SHAP & PDP SECTION ---
             st.subheader("📊 Model Interpretability")
-            
-            # 1. Calculate SHAP
             explainer = shap.TreeExplainer(st.session_state.ml_model)
             shap_values = explainer.shap_values(st.session_state.X_test)
             
-            col_shap, col_pdp = st.columns(2)
+            st.markdown("**Feature Importance (SHAP Summary)**")
+            fig_shap, ax_shap = plt.subplots(figsize=(8, 4))
+            shap.summary_plot(shap_values, st.session_state.X_test, show=False)
+            st.pyplot(fig_shap)
+            plt.clf()
             
-            with col_shap:
-                st.markdown("**Feature Importance (SHAP Summary)**")
-                st.caption("Shows which parameters drive the target and in which direction.")
-                fig_shap, ax_shap = plt.subplots(figsize=(6, 4))
-                shap.summary_plot(shap_values, st.session_state.X_test, show=False, plot_size=(6,4))
-                st.pyplot(fig_shap)
-                plt.clf()
+            st.divider()
+            st.markdown("**Partial Dependence Plots (Top 3 Parameters)**")
             
-            with col_pdp:
-                st.markdown("**Partial Dependence Plots (Top 3 Parameters)**")
-                st.caption("Shows the isolated marginal effect of the top parameters on the target.")
-                
-                # Extract Top 3 Features based on mean absolute SHAP value
-                mean_shap_vals = np.abs(shap_values).mean(axis=0)
-                shap_importance = pd.DataFrame(list(zip(st.session_state.features, mean_shap_vals)), columns=['feature', 'importance'])
-                shap_importance = shap_importance.sort_values(by='importance', ascending=False)
-                top_3_features = shap_importance['feature'].head(3).tolist()
-                
-                if top_3_features:
-                    fig_pdp, ax_pdp = plt.subplots(figsize=(6, 4))
-                    # Adjust layout based on number of features (up to 3)
-                    n_cols = min(len(top_3_features), 3)
-                    PartialDependenceDisplay.from_estimator(
-                        st.session_state.ml_model, 
-                        st.session_state.X_train, 
-                        top_3_features, 
-                        ax=ax_pdp, 
-                        n_cols=n_cols,
-                        grid_resolution=20
-                    )
-                    fig_pdp.tight_layout()
-                    st.pyplot(fig_pdp)
-                    plt.clf()
+            # Extract Top 3 Features
+            mean_shap_vals = np.abs(shap_values).mean(axis=0)
+            shap_importance = pd.DataFrame(list(zip(st.session_state.features, mean_shap_vals)), columns=['feature', 'importance'])
+            shap_importance = shap_importance.sort_values(by='importance', ascending=False)
+            top_3_features = shap_importance['feature'].head(3).tolist()
+            
+            # Show THREE distinct plots dynamically
+            if top_3_features:
+                pdp_cols = st.columns(len(top_3_features))
+                for idx, feat in enumerate(top_3_features):
+                    with pdp_cols[idx]:
+                        fig_pdp, ax_pdp = plt.subplots(figsize=(4, 3))
+                        PartialDependenceDisplay.from_estimator(
+                            st.session_state.ml_model, 
+                            st.session_state.X_train, 
+                            [feat], 
+                            ax=ax_pdp, 
+                            grid_resolution=20
+                        )
+                        ax_pdp.set_title(f"PDP: {feat}")
+                        fig_pdp.tight_layout()
+                        st.pyplot(fig_pdp)
+                        plt.clf()
             
             st.divider()
             
@@ -378,21 +370,23 @@ with tab5:
             bounds.append((lower, upper))
             
         if st.button("Run Optimizer"):
-            with st.spinner("Finding optimal regime..."):
+            with st.spinner("Finding optimal regime using Differential Evolution..."):
                 def objective(x):
+                    # We wrap x in a DataFrame using the correct feature names
                     pred = st.session_state.ml_model.predict(pd.DataFrame([x], columns=st.session_state.features))[0]
                     return -pred if opt_goal == "Maximize Target" else pred
                 
-                x0 = [(b[0] + b[1]) / 2 for b in bounds]
-                res = minimize(objective, x0, method='L-BFGS-B', bounds=bounds)
+                # Using Differential Evolution, which works exceptionally well for tree-based models
+                res = differential_evolution(objective, bounds=bounds, seed=42)
                 
                 if res.success:
                     st.success("Optimization Converged!")
                     opt_pred = -res.fun if opt_goal == "Maximize Target" else res.fun
                     st.metric(label=f"Optimized {st.session_state.target}", value=f"{opt_pred:.4f}")
+                    
                     st.subheader("Recommended Setpoints")
                     st.json({feat: round(val, 2) for feat, val in zip(st.session_state.features, res.x)})
                 else:
-                    st.error("Optimization failed to converge. Relax constraints.")
+                    st.error("Optimization failed to converge. Try relaxing constraints.")
     else:
         st.info("Train the Digital Twin model in Tab 4 first.")
