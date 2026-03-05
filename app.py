@@ -30,7 +30,7 @@ def process_quality_sheet(df, suffix):
     if date_col and time_col:
         # 1. Clean the string representations
         date_series = df[date_col].astype(str).str.replace('.', '/', regex=False)
-        time_series = df[time_col].astype(str)
+        time_series = df[time_col].astype(str).str.replace('.', ':', regex=False)
         
         # 2. Force strict datetime parsing. We use dayfirst=True, but we also specify 
         # format='%d/%m/%Y %H:%M:%S' as a fallback if dayfirst gets confused.
@@ -81,20 +81,16 @@ with tab1:
                 if process_file.name.endswith('.csv'): df_process = pd.read_csv(process_file)
                 else: df_process = pd.read_excel(process_file)
                     
-                ts_col = [c for c in df_process.columns if 'time' in c.lower() or 'date' in c.lower()][0]
-                
-                # Check if it's already a datetime object from Excel
-                if pd.api.types.is_datetime64_any_dtype(df_process[ts_col]):
-                    df_process['Timestamp'] = df_process[ts_col]
-                else:
-                    # It's a string, so clean the dots and parse with dayfirst
-                    ts_series = df_process[ts_col].astype(str).str.replace('.', '/', regex=False)
-                    try:
-                         # Try explicit format first if you know it's strictly DD/MM/YYYY
-                         df_process['Timestamp'] = pd.to_datetime(ts_series, format='%d/%m/%Y %H:%M:%S', errors='coerce')
-                    except:
-                         # Fallback to dayfirst if the time format is irregular (e.g., missing seconds)
-                         df_process['Timestamp'] = pd.to_datetime(ts_series, dayfirst=True, errors='coerce')
+                ts_col = [c for c in df_process.columns if 'timestamp' in c.lower()][0]
+
+                # It's a string, so clean the dots and parse with dayfirst
+                ts_series = df_process[ts_col].astype(str).str.replace('.', '/', regex=False)
+                try:
+                     # Try explicit format first if you know it's strictly DD/MM/YYYY
+                     df_process['Timestamp'] = pd.to_datetime(ts_series, format='%d/%m/%Y %H:%M', errors='coerce')
+                except:
+                     # Fallback to dayfirst if the time format is irregular (e.g., missing seconds)
+                     df_process['Timestamp'] = pd.to_datetime(ts_series, dayfirst=True, errors='coerce')
                 
                 if ts_col != 'Timestamp': df_process = df_process.drop(columns=[ts_col])
                 df_process = df_process.dropna(subset=['Timestamp'])
