@@ -7,13 +7,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 from sklearn.inspection import PartialDependenceDisplay
 import xgboost as xgb
-from scipy.optimize import differential_evolution  # Changed for XGBoost compatibility
+from scipy.optimize import differential_evolution
 import shap
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="Distillation Digital Twin (PoC)", layout="wide", page_icon="🧪")
 st.title("🧪 Distillation Column Digital Twin (PoC)")
-# Caption removed as requested
 
 # --- SESSION STATE INITIALIZATION ---
 for key in ['stitched_data', 'filtered_data', 'ml_model', 'features', 'target', 'X_train', 'X_test']:
@@ -110,12 +109,20 @@ with tab1:
                 df_stitched = df_stitched.dropna(subset=qual_cols, how='all')
 
             st.success("✅ Data Cleaned, Stitched, and Interpolated Successfully!")
-            st.divider()
+            
+            # --- SHOW DATAPOINTS READ ---
+            st.info(f"📊 **Data Points Processed:** \n"
+                    f"- **Process Data:** {len(df_process)} aggregated rows \n"
+                    f"- **Feed Quality:** {len(feed_df)} rows \n"
+                    f"- **Top Quality:** {len(top_df)} rows \n"
+                    f"- **Bottom Quality:** {len(bot_df)} rows \n"
+                    f"- **Final Stitched Dataset:** {len(df_stitched)} rows")
 
-            # --- POPULATE SESSION STATE IMMEDIATELY SO USER CAN SKIP GENERATING FEATURES ---
+            # Store in session state so user can immediately navigate to Tab 2
             st.session_state.stitched_data = df_stitched.copy()
             st.session_state.filtered_data = df_stitched.copy()
 
+            st.divider()
             st.subheader("Data Overview (Post-Stitching)")
             display_df = df_stitched.copy()
             
@@ -133,35 +140,6 @@ with tab1:
                 
             st.write("**Summary Statistics:**")
             st.dataframe(df_stitched.describe() if not df_stitched.empty else pd.DataFrame())
-            
-            st.divider()
-            
-            st.subheader("2. Engineer Physics Features (Optional)")
-            all_cols = ['None'] + list(df_stitched.columns)
-            c1, c2, c3, c4 = st.columns(4)
-            feed_c = c1.selectbox("Feed Flow", all_cols)
-            top_c = c2.selectbox("Distillate (Top) Flow", all_cols)
-            steam_c = c3.selectbox("Steam Flow", all_cols)
-            reflux_c = c4.selectbox("Reflux Flow", all_cols)
-            
-            c5, c6, c7, c8 = st.columns(4)
-            t1_c = c5.selectbox("1st Bed Temp", all_cols)
-            t2_c = c6.selectbox("Last Bed Temp", all_cols)
-            p1_c = c7.selectbox("1st Bed Pressure", all_cols)
-            p2_c = c8.selectbox("Last Bed Pressure", all_cols)
-            
-            if st.button("Generate Features"):
-                if top_c != 'None' and feed_c != 'None': df_stitched['D/F_Ratio'] = df_stitched[top_c] / (df_stitched[feed_c] + 1e-9)
-                if steam_c != 'None' and feed_c != 'None': df_stitched['Steam/Feed_Ratio'] = df_stitched[steam_c] / (df_stitched[feed_c] + 1e-9)
-                if steam_c != 'None' and top_c != 'None': df_stitched['Steam/Top_Ratio'] = df_stitched[steam_c] / (df_stitched[top_c] + 1e-9)
-                if reflux_c != 'None' and top_c != 'None': df_stitched['Reflux_Ratio'] = df_stitched[reflux_c] / (df_stitched[top_c] + 1e-9)
-                if t1_c != 'None' and t2_c != 'None': df_stitched['Delta_T'] = df_stitched[t1_c] - df_stitched[t2_c]
-                if p1_c != 'None' and p2_c != 'None': df_stitched['Delta_P'] = df_stitched[p1_c] - df_stitched[p2_c]
-                
-                # Re-update session state
-                st.session_state.stitched_data = df_stitched
-                st.session_state.filtered_data = df_stitched.copy()
-                st.success("Features Generated! Go to Tab 2.")
                 
         except Exception as e:
             st.error(f"Error processing files: {e}")
@@ -193,14 +171,21 @@ with tab2:
         st.subheader("📈 Exploratory Data Analysis")
         all_cols = df_filtered.columns.drop('Timestamp').tolist()
         
-        # FULL WIDTH TIME SERIES
-        trend_cols = st.multiselect("Time Series Trends", all_cols, default=all_cols[:1])
-        if trend_cols: 
-            st.plotly_chart(px.line(df_filtered, x='Timestamp', y=trend_cols), use_container_width=True)
+        # --- SINGLE SELECT FOR TIME SERIES & HISTOGRAM ---
+        trend_col = st.selectbox("Select Parameter to Analyze (Trend & Distribution)", all_cols, index=0)
+        
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            fig_line = px.line(df_filtered, x='Timestamp', y=trend_col, title=f"{trend_col} over Time")
+            st.plotly_chart(fig_line, use_container_width=True)
+        with col_t2:
+            fig_hist = px.histogram(df_filtered, x=trend_col, marginal="box", title=f"Distribution of {trend_col}")
+            st.plotly_chart(fig_hist, use_container_width=True)
         
         st.divider()
         
-        # FULL WIDTH SCATTER
+        # --- SCATTER PLOT ---
+        st.subheader("📊 Scatter Plot")
         col_s1, col_s2 = st.columns(2)
         with col_s1: scat_x = st.selectbox("Scatter X-axis", all_cols, index=0)
         with col_s2: scat_y = st.selectbox("Scatter Y-axis", all_cols, index=1 if len(all_cols)>1 else 0)
@@ -208,7 +193,7 @@ with tab2:
 
         st.divider()
         
-        # FULL WIDTH HEATMAP
+        # --- HEATMAP ---
         
         st.subheader("🔥 Correlation Heatmap")
         corr_cols = st.multiselect("Select parameters for Correlation Heatmap", all_cols, default=all_cols[:6] if len(all_cols)>6 else all_cols)
@@ -244,7 +229,6 @@ with tab3:
                     fig.update_layout(showlegend=False)
                     st.plotly_chart(fig, use_container_width=True)
                 
-                # Removed the bottom summary statistics table as requested.
             except ValueError as e:
                 st.warning(f"Could not create bins for {q_target}. Error: {e}")
     else:
@@ -372,11 +356,9 @@ with tab5:
         if st.button("Run Optimizer"):
             with st.spinner("Finding optimal regime using Differential Evolution..."):
                 def objective(x):
-                    # We wrap x in a DataFrame using the correct feature names
                     pred = st.session_state.ml_model.predict(pd.DataFrame([x], columns=st.session_state.features))[0]
                     return -pred if opt_goal == "Maximize Target" else pred
                 
-                # Using Differential Evolution, which works exceptionally well for tree-based models
                 res = differential_evolution(objective, bounds=bounds, seed=42)
                 
                 if res.success:
